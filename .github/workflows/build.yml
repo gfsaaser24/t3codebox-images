@@ -1,0 +1,143 @@
+name: Build T3CodeBox image
+
+# Builds kristofk/T3CodeBox (pinned below) with an upstream T3 Code release, adds the preview-browser
+# layer, runs T3CodeBox's own test suite on the final image, and pushes ghcr.io/<owner>/t3codebox:<T3 version>.
+# Deployments run that exact tag. Every hour: builds the newest nightly and the newest stable
+# release whose tag is not in the registry yet. Deploying stays a manual step (it restarts the box).
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: T3 Code version, e.g. 0.0.46-nightly.20261013.3066 (empty = newest nightly + newest stable)
+        required: false
+        default: ""
+      force:
+        description: Rebuild and overwrite the tag even if it exists
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/t3codebox
+  # kristofk/T3CodeBox commit to build. Bump on purpose, after reading what changed.
+  T3CODEBOX_REF: 40c0382e40b427428d739e8ad12eacaf077b67be
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      versions: ${{ steps.pick.outputs.versions }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          FORCE: ${{ inputs.force && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          if [ -n "$VERSION" ]; then
+            candidates=${VERSION#v}
+          else
+            nightly=$(gh api 'repos/pingdotgg/t3code/releases?per_page=30' \
+              --jq '[.[] | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+-nightly\\."))][0].tag_name')
+            stable=$(gh api repos/pingdotgg/t3code/releases/latest --jq .tag_name)
+            candidates="${nightly#v} ${stable#v}"
+          fi
+          todo=()
+          for v in $candidates; do
+            if [ "$FORCE" != 1 ] && docker buildx imagetools inspect "$IMAGE:$v" >/dev/null 2>&1; then
+              echo "$IMAGE:$v already exists"
+              continue
+            fi
+            todo+=("$v")
+          done
+          versions=$(printf '%s\n' "${todo[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
+          echo "to build: $versions"
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.versions != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.plan.outputs.versions) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      V: ${{ matrix.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: kristofk/T3CodeBox
+          ref: ${{ env.T3CODEBOX_REF }}
+          path: T3CodeBox
+
+      # The default docker builder, so the layer below can start FROM the locally built image.
+      - name: Build T3CodeBox
+        working-directory: T3CodeBox
+        run: T3_VERSION="$V" IMAGE_VERSION="$V-ours" make build
+
+      - name: Add the preview-browser layer
+        run: |
+          docker build --build-arg BASE=t3codebox:test \
+            --build-arg SOURCE="${{ github.server_url }}/${{ github.repository }}" \
+            -t t3codebox:test browser-layer
+          docker image inspect t3codebox:test --format '{{json .Config.Env}}' | grep -q 'T3CODE_SERVER_BROWSER_SANDBOX=0'
+          docker run --rm --entrypoint dpkg t3codebox:test -s libnss3 libgbm1 fonts-liberation >/dev/null
+
+      - name: Test the final image (T3CodeBox suite)
+        working-directory: T3CodeBox
+        run: make test
+
+      # The image is public: refuse to push one that contains a live credential.
+      - name: Secret scan (TruffleHog, verified results fail the build)
+        run: |
+          docker save t3codebox:test -o "$RUNNER_TEMP/image.tar"
+          docker run --rm -v "$RUNNER_TEMP:/scan:ro" trufflesecurity/trufflehog:3.99.2 \
+            docker --image file:///scan/image.tar --results=verified --fail --no-update
+          rm "$RUNNER_TEMP/image.tar"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        run: |
+          docker tag t3codebox:test "$IMAGE:$V"
+          docker push "$IMAGE:$V"
+          {
+            echo "Pushed \`$IMAGE:$V\`"
+            echo
+            echo "- digest: \`$(docker image inspect "$IMAGE:$V" --format '{{index .RepoDigests 0}}')\`"
+            echo "- t3: \`$(docker run --rm --entrypoint t3 "$IMAGE:$V" --version 2>&1 | tail -1)\`"
+            echo "- T3CodeBox: \`$T3CODEBOX_REF\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.version }}
+          path: |
+            T3CodeBox/ci-out/test-results-*.txt
+            T3CodeBox/ci-out/versions-*.txt
