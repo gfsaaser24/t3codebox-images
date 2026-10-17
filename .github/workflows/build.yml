@@ -104,6 +104,17 @@ jobs:
           docker image inspect t3codebox:test --format '{{json .Config.Env}}' | grep -q 'T3CODE_SERVER_BROWSER_SANDBOX=0'
           docker run --rm --entrypoint dpkg t3codebox:test -s libnss3 libgbm1 fonts-liberation >/dev/null
 
+      - name: Add the usage-hub layer
+        run: |
+          docker build --build-arg BASE=t3codebox:test \
+            --build-arg SOURCE="${{ github.server_url }}/${{ github.repository }}" \
+            -t t3codebox:test usage-hub-layer
+          docker image inspect t3codebox:test --format '{{json .Config.Entrypoint}} {{json .Config.Cmd}}' \
+            | grep -qF '["/usr/bin/tini","--","/usr/local/bin/t3codebox-usage-hub"] ["t3","serve"]'
+          docker run --rm --entrypoint /usr/local/lib/t3codebox-usage-hub/cli-proxy-api t3codebox:test --help 2>&1 \
+            | grep -q 'CLIProxyAPI Version'
+          docker run --rm --entrypoint /usr/local/bin/node t3codebox:test --check /usr/local/lib/t3codebox-usage-hub/usage-shim.js
+
       - name: Test the final image (T3CodeBox suite)
         working-directory: T3CodeBox
         run: make test

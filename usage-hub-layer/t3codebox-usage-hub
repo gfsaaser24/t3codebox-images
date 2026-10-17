@@ -1,0 +1,28 @@
+#!/bin/bash
+# Entrypoint of the usage-hub layer: when the box has a CLIProxyAPI configuration in its home volume, starts the
+# hub and the usage shim (each restarted whenever it exits, so neither can take T3 down), then runs T3CodeBox's
+# own entrypoint with the command unchanged. Without the configuration it only hands over.
+set -euo pipefail
+
+dir="$HOME/.cli-proxy-api"
+lib=/usr/local/lib/t3codebox-usage-hub
+
+# Logs live next to the configuration; one that grew past 10 MB starts over.
+supervise() {
+  local name=$1 log="$dir/$2"
+  shift 2
+  (cd "$dir" && while :; do
+    if [ -f "$log" ] && [ "$(stat -c %s "$log")" -gt 10485760 ]; then : > "$log"; fi
+    "$@" >> "$log" 2>&1 || true
+    echo "t3codebox: $name stopped; restarting it in 5 s" >&2
+    sleep 5
+  done &)
+}
+
+if [ -f "$dir/config.yaml" ]; then
+  supervise "the usage hub" server.log "$lib/cli-proxy-api" -config "$dir/config.yaml"
+  # The image's Node by path: a `node` on PATH may be a mise shim.
+  supervise "the usage shim" usage-shim.log /usr/local/bin/node "$lib/usage-shim.js"
+fi
+
+exec /usr/local/bin/t3codebox-entrypoint "$@"
