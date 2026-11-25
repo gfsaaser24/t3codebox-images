@@ -3,6 +3,8 @@
 // (`claude setup-token`) have only the user:inference scope, so that endpoint refuses them (403 user:profile).
 // The same token still gets the unified rate-limit headers on any Messages call, so on a refusal the shim makes
 // a 1-token request through the hub and answers T3 with those numbers in the /api/oauth/usage shape.
+// The request uses Fable: only a request to the model with its own weekly bucket gets that bucket's headers
+// (`7d_oi`, "seven_day_overage_included"), which the shim reports to T3 as a model-scoped weekly limit.
 "use strict";
 
 const http = require("node:http");
@@ -11,6 +13,9 @@ const LISTEN_PORT = Number(process.env.SHIM_PORT || 8318);
 const HUB = new URL(process.env.HUB_URL || "http://127.0.0.1:8317");
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const CACHE_MS = 5 * 60 * 1000;
+// The model whose weekly bucket the `7d_oi` headers describe, and the name T3 shows it under.
+const SCOPED_MODEL = "claude-fable-5-2";
+const SCOPED_MODEL_NAME = "Fable";
 const cache = new Map(); // auth_index -> { at, body }
 
 function hubRequest(method, path, headers, body) {
@@ -58,7 +63,7 @@ async function usageFromHeaders(authHeader, authIndex) {
       "Content-Type": "application/json",
     },
     data: JSON.stringify({
-      model: "claude-haiku-4-5",
+      model: SCOPED_MODEL,
       max_tokens: 1,
       system: "You are Claude Code, Anthropic's official CLI for Claude.",
       messages: [{ role: "user", content: "." }],
@@ -73,8 +78,20 @@ async function usageFromHeaders(authHeader, authIndex) {
   const result = JSON.parse(response.body.toString("utf8"));
   const five_hour = window(result.header, "5h");
   const seven_day = window(result.header, "7d");
-  if (!five_hour && !seven_day) return null;
-  return JSON.stringify({ five_hour, seven_day });
+  const scoped = window(result.header, "7d_oi");
+  if (!five_hour && !seven_day && !scoped) return null;
+  // T3 reads model-scoped weeklies from `limits[]` (kind weekly_scoped, percent 0-100).
+  const limits = scoped
+    ? [
+        {
+          kind: "weekly_scoped",
+          percent: scoped.utilization,
+          resets_at: scoped.resets_at,
+          scope: { model: { display_name: SCOPED_MODEL_NAME } },
+        },
+      ]
+    : [];
+  return JSON.stringify({ five_hour, seven_day, limits });
 }
 
 async function handleUsageCall(request, body, call) {
