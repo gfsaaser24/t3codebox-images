@@ -28,8 +28,10 @@ Claude account it asks the hub to call `https://api.anthropic.com/api/oauth/usag
 (`claude setup-token`, `sk-ant-oat01-…`) have only the `user:inference` scope, so that endpoint refuses them
 (403, `user:profile` required). The same token still receives the `anthropic-ratelimit-unified-5h/7d-*` headers
 on every Messages call. `usage-shim.js` sits in front of the hub, passes everything through, and on a refused
-usage read makes a 1-token Haiku request with that account's token and answers T3 from those headers (cached
-5 minutes per account).
+usage read makes a 1-token Fable request with that account's token and answers T3 from those headers (cached
+5 minutes per account). The request uses Fable because only a Fable request returns the headers of Fable's own
+weekly bucket (`anthropic-ratelimit-unified-7d_oi-*`); the shim passes it to T3 as a model-scoped weekly limit
+("Weekly · Fable").
 
 The layer's entrypoint starts the hub (127.0.0.1:8317) and the shim (127.0.0.1:8318) only when the home volume has
 `~/.cli-proxy-api/config.yaml`; without it the box behaves exactly as before. Set up a box once:
